@@ -50,7 +50,7 @@ typedef VOID( CDECL* PWOW64_FUNCTION_HOOK )(
  * @brief Intercept 64-bit code, capture it's context, and forward it to a handler function
  * 
  *        --- HOW TO USE ---
- *        The handler function operated similarly to an exception handler. When the detour is reached,
+ *        The handler function operates similarly to an exception handler. When the detour is reached,
  *        it will capture the 64-bit context and forward this context to it.
  *        The 64-bit context structure is meant to be used for all adjustments made to the 64-bit context,
  *        and will be restored upon the return of the handler function.
