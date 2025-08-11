@@ -2,6 +2,9 @@
 
 #if defined _WIN32 && !_WIN64
 
+#pragma warning( push )
+#pragma warning( disable : 6101 )
+
 #define WOW64API __declspec( noinline, naked )
 
 UINT64 g_Wow64InfoPtr      = NULL;
@@ -23,6 +26,11 @@ UINT8 Wow64HookTransition_Data[ ]
     //
     0x65, 0x48, 0x89, 0x24, 0x25, 0xE0, 0x02, 0x00, 0x00, // mov qword ptr gs:0x2E0, rsp
     0x48, 0x83, 0xE4, 0xF0,                               // and rsp, 0xFFFFFFFFFFFFFFF0
+
+    //
+    // sub rsp, 0x1000
+    //
+    0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00,
 
     //
     // Free up space on the stack for the 64-bit context
@@ -68,12 +76,9 @@ UINT8 Wow64HookTransition_Data[ ]
     //
     // Store RIP
     //
-    0x48, 0x8B, 0x84, 0x24, 0xD8, 0x04, 0x00, 0x00,       // mov rax, qword ptr[rsp+0x4D8]
+    0x48, 0x8B, 0x40, 0xF8,                               // mov rax, qword ptr[rax-0x8]
     0x48, 0x83, 0xE8, 0x06,                               // sub rax, 6
     0x48, 0x89, 0x84, 0x24, 0xF8, 0x00, 0x00, 0x00,       // mov qword ptr[rsp+0xF8], rax
-
-   
-    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,       // Miscellaneous
 
     //
     // Store MXCSR
@@ -142,11 +147,11 @@ UINT8 Wow64HookTransition_Data[ ]
 #pragma pack( push, 1 )
 typedef struct _WOW64_HOOK_TRANSITION
 {
-    UINT8  Padding01    [ 0xF6 ];
+    UINT8  Padding01    [ 0xF1 ];
     LPVOID HandlerFunction;
     UINT8  Padding02    [ 0xF0 ];
     UINT64 Target;
-    UINT8  OriginalBytes[ 0xE ];
+    UINT8  OriginalBytes[ 0x13 ];
 }WOW64_HOOK_TRANSITION, * PWOW64_HOOK_TRANSITION;
 static_assert( sizeof( _WOW64_HOOK_TRANSITION ) == 512, "Size of _WOW64_HOOK_TRANSITION does not match the assertion!" );
 #pragma pack( pop )
@@ -702,6 +707,62 @@ Wow64ProtectVirtualMemory(
     return Result;
 }
 
+VOID 
+Wow64InstallHook_PrepareCallInstruction( 
+    _In_ UINT64 Target,
+    _In_ LPVOID TransitionHandler,
+    _In_ LPVOID CallInstruction,
+    _In_ SIZE_T CallLength,
+    _In_ SIZE_T CallRVAOffset
+    )
+{
+    SYSTEM_INFO SystemInfo{};
+
+    GetSystemInfo( &SystemInfo );
+
+    //
+    // Align the target address down to the nearest allocation granularity.
+    //
+    UINT64 TargetAddress = ( UINT64 ) Target & ~( ( UINT64 )SystemInfo.dwAllocationGranularity - 1ull );
+    DWORD  Protect1      = PAGE_EXECUTE_READWRITE,
+           Protect2      = Protect1;
+
+    //
+    // Locate function padding large enough to house our absolute address
+    //
+    while ( Wow64ReadData< UINT64 >( TargetAddress ) != 0xCCCCCCCCCCCCCCCC )
+    {
+        //
+        // Increment the address
+        //
+        TargetAddress++;
+    }
+
+    //
+    // Configure the relative address for the call instruction
+    //
+    INT32 CallRVA = ( INT32 )( TargetAddress - ( Target + CallLength ) );
+    *( INT32* )( ( UINT8* )CallInstruction + CallRVAOffset ) = CallRVA;
+
+    //
+    // Adjust protection state
+    //
+    Wow64ProtectVirtualMemory( TargetAddress, sizeof( UINT64 ), Protect1, &Protect1 );
+    Wow64ProtectVirtualMemory( Target,        sizeof( UINT64 ), Protect2, &Protect2 );
+
+    //
+    // Store the absolute address to the handler function in the padding
+    //
+    Wow64WriteData< UINT64 >( TargetAddress, ( UINT64 )TransitionHandler );
+    Wow64CopyMemory( Target, ( UINT64 )CallInstruction, CallLength );
+
+    //
+    // Restore protection state
+    //
+    Wow64ProtectVirtualMemory( Target,        sizeof( UINT64 ), Protect2, &Protect2 );
+    Wow64ProtectVirtualMemory( TargetAddress, sizeof( UINT64 ), Protect1, &Protect1 );
+}
+
 BOOLEAN
 Wow64InstallHook(
     _In_ UINT64               Target,
@@ -729,8 +790,10 @@ Wow64InstallHook(
             );
     }
 
-    sizeof( WOW64_HOOK_TRANSITION );
-        
+    if ( g_Wow64HookHandlers == NULL ) {
+        __fastfail( 0 );
+    }
+
     PWOW64_HOOK_TRANSITION CurrentHookHandler = ( PWOW64_HOOK_TRANSITION )g_Wow64HookHandlers;
     BOOLEAN                HasSpace           = FALSE;
 
@@ -747,36 +810,21 @@ Wow64InstallHook(
 
     if ( HasSpace == FALSE )
         return FALSE;
-    
-    DWORD Protect = PAGE_EXECUTE_READWRITE;
 
     //
-    // Configure our absolute call instruction to call our shellcode
-    //
-    *( LPVOID* )( CallQwordPtrRip00Dest + 6 ) = CurrentHookHandler;
-
-    //
-    // Grab the 64-bit to 32-bit transition/hook shellcode
+    // Prepare the hook handler data
     //
     RtlCopyMemory( CurrentHookHandler, Wow64HookTransition_Data, sizeof( Wow64HookTransition_Data ) );
 
-    // 
-    // Configure this shellcode to call our handler
-    //
     CurrentHookHandler->HandlerFunction = Handler;
     CurrentHookHandler->Target          = Target;
 
-    //
-    // Save the 14(size of absolute call) original bytes we will be overwriting
-    //
-    Wow64CopyMemory( ( UINT64 )CurrentHookHandler->OriginalBytes, Target, sizeof( CurrentHookHandler->OriginalBytes ) );
+    Wow64CopyMemory( ( UINT64 )CurrentHookHandler->OriginalBytes, ( UINT64 )Target, sizeof( CurrentHookHandler->OriginalBytes ) );
 
     //
-    // Apply our patch to the target function
+    // Configure and apply call instruction
     //
-    Wow64ProtectVirtualMemory( ( UINT64 )Target, 0x1000, Protect, &Protect );
-    Wow64CopyMemory( ( UINT64 )Target, ( UINT64 )CallQwordPtrRip00Dest, sizeof( CallQwordPtrRip00Dest ) );
-    Wow64ProtectVirtualMemory( ( UINT64 )Target, 0x1000, Protect, &Protect );
+    Wow64InstallHook_PrepareCallInstruction( Target, CurrentHookHandler, CallQwordPtrRip00Dest, 6, 2 );
 
     return TRUE;
 }
@@ -822,4 +870,5 @@ Wow64RemoveHook(
     CurrentHookHandler->HandlerFunction = NULL;
 }
 
+#pragma warning( pop )
 #endif
