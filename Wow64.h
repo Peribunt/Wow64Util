@@ -1,6 +1,9 @@
 #ifndef __WOW64_H__
 #define __WOW64_H__
 
+#pragma warning( push )
+#pragma warning( disable : 6506 )
+
 //
 // This header is only relevant in 32-bit mode
 //
@@ -45,6 +48,14 @@
 typedef VOID( CDECL* PWOW64_FUNCTION_HOOK )(
     _Inout_ PCONTEXT64 Context
     );
+
+/**
+ * @brief Pointer to a 64-bit exception handler
+ */
+typedef LONG( CDECL* PWOW64_VECTORED_EXCEPTION_HANDLER )(
+	_In_ PCONTEXT64          ContextRecord,
+	_In_ PEXCEPTION_RECORD64 ExceptionRecord
+	);
 
 /**
  * @brief Intercept 64-bit code, capture it's context, and forward it to a handler function
@@ -287,6 +298,35 @@ Wow64RegisterInstrumentationCallback(
     );
 
 /**
+ * @brief Add a 64-bit vectored exception handler to handle exceptions that occur in all areas of the running process
+ * 
+ * @param [in] VectoredHandler: Pointer to an exception handler function. This handler function is intended
+ *                              to work the exact same way as a normal vectored exception handler.
+ *                              Where returning EXCEPTION_CONTINUE_EXECUTION results in immediate continuation of execution,
+ *                              and returning EXCEPTION_CONTINUE_SEARCH results in forwarding to other potential handlers in the list.
+ * 
+ * @return TRUE if the vectored handler was successfully added
+ * @return FALSE if the vectored handler was not successfully added
+ */
+BOOLEAN
+Wow64AddVectoredExceptionHandler( 
+	_In_ PWOW64_VECTORED_EXCEPTION_HANDLER VectoredHandler
+	);
+
+/**
+ * @brief Remove a previously added vectored exception handler
+ * 
+ * @param [in] VectoredHandler: The vectored exception handler to remove
+ * 
+ * @return TRUE if the vectored exception handler was found and removed
+ * @return FALSE if the vectored exception handler was not added in the first place
+ */
+BOOLEAN
+Wow64RemoveVectoredExceptionHandler( 
+	_In_ PWOW64_VECTORED_EXCEPTION_HANDLER VectoredHandler
+	);
+
+/**
  * @brief Read a QWORD at a specified offset from the GS base(TEB base in usermode)
  * 
  * @param [in] Offset: The offset in QWORDs from the GS base at which to read the QWORD
@@ -333,6 +373,8 @@ UINT8
 Wow64ReadGsByte( 
     _In_ UINT32 Offset 
     );
+
+#pragma warning( pop )
 
 #endif
 #endif

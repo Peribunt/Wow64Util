@@ -6,11 +6,51 @@
 #pragma warning( disable : 6101 )
 
 #define WOW64API __declspec( noinline, naked )
+#define WOW64_MAX_VECTORED_HANDLERS 128
 
-UINT64 g_Wow64InfoPtr      = NULL;
-LPVOID g_Wow64HookHandlers = NULL;
+#define Wow64AcquireSpinlock( _ ) while( _InterlockedExchange8( &_, TRUE ) == TRUE ) \
+                                    _mm_pause( )
+#define Wow64ReleaseSpinlock( _ ) _InterlockedExchange8( &_, FALSE )
 
-UINT64 NtProtectVirtualMemory64 = NULL;
+//
+// Our vectored exception handler list
+//
+PWOW64_VECTORED_EXCEPTION_HANDLER g_Wow64VectoredExceptionHandlers[ WOW64_MAX_VECTORED_HANDLERS ];
+
+//
+// Wow64InfoPtr for instrumentation callbacks from the wow64 layer
+//
+UINT64 g_Wow64InfoPtr             = NULL;
+
+//
+// Wow64PrepareForException for the 64-bit KiUserExceptionDispatcher hook
+//
+UINT64 g_Wow64PrepareForException = NULL;
+
+//
+// A pointer to our function hook handler shellcode
+//
+LPVOID g_Wow64HookHandlers        = NULL;
+
+//
+// Spinlock for VEH list functions
+//
+CHAR g_Wow64VEHListLock           = FALSE;
+
+//
+// Spinlock for hook list functions
+//
+CHAR g_Wow64HookListLock          = FALSE;
+
+//
+// 64-bit NtProtectVirtualMemory pointer
+//
+UINT64 NtProtectVirtualMemory64   = NULL;
+
+//
+// 64-bit NtContinue pointer
+//
+UINT64 NtContinue64               = NULL;
 
 UINT8 Wow64HookTransition_Data[ ]
 {
@@ -473,7 +513,7 @@ Wow64GetInfoPtr(
     //     mov cs:Wow64InfoPtr, gpr
     //
 	for ( UINT32 i = 0; i < sizeof( FuncData ); i++ )
-	{
+	{        
 		//
 		// Search for a mov instruction (REX.W + 0x89)
 		//
@@ -769,6 +809,8 @@ Wow64InstallHook(
     _In_ PWOW64_FUNCTION_HOOK Handler
     )
 {
+    Wow64AcquireSpinlock( g_Wow64HookListLock );
+
 #define WOW64_MAX_HOOK_HANDLERS 128
 
     UINT8 CallQwordPtrRip00Dest[ ] =
@@ -790,7 +832,9 @@ Wow64InstallHook(
             );
     }
 
-    if ( g_Wow64HookHandlers == NULL ) {
+    if ( g_Wow64HookHandlers == NULL ) 
+    {
+        Wow64ReleaseSpinlock( g_Wow64HookListLock );
         __fastfail( 0 );
     }
 
@@ -809,7 +853,10 @@ Wow64InstallHook(
     }
 
     if ( HasSpace == FALSE )
+    {
+        Wow64ReleaseSpinlock( g_Wow64HookListLock );
         return FALSE;
+    }
 
     //
     // Prepare the hook handler data
@@ -826,6 +873,8 @@ Wow64InstallHook(
     //
     Wow64InstallHook_PrepareCallInstruction( Target, CurrentHookHandler, CallQwordPtrRip00Dest, 6, 2 );
 
+    Wow64ReleaseSpinlock( g_Wow64HookListLock );
+
     return TRUE;
 }
 
@@ -836,6 +885,8 @@ Wow64RemoveHook(
 {
     if ( g_Wow64HookHandlers == NULL )
         return;
+
+    Wow64AcquireSpinlock( g_Wow64HookListLock );
 
     PWOW64_HOOK_TRANSITION CurrentHookHandler = ( PWOW64_HOOK_TRANSITION )g_Wow64HookHandlers;
     BOOLEAN                Located            = FALSE;
@@ -868,6 +919,138 @@ Wow64RemoveHook(
     // Invalidate the shellcode, so that it can be reused by Wow64InstallHook
     //
     CurrentHookHandler->HandlerFunction = NULL;
+
+    Wow64ReleaseSpinlock( g_Wow64HookListLock );
+}
+
+VOID
+Wow64HandleKiUserExceptionDispatcher( 
+    _In_ PCONTEXT64 Context 
+    )
+{
+    PCONTEXT64          ExceptionContext = ( PCONTEXT64          )( Context->Rsp         );
+    PEXCEPTION_RECORD64 ExceptionRecord  = ( PEXCEPTION_RECORD64 )( Context->Rsp + 0x4F0 );
+
+    for ( UINT32 i = 0; i < WOW64_MAX_VECTORED_HANDLERS; i++ )
+    {
+        PWOW64_VECTORED_EXCEPTION_HANDLER CurrentHandler = g_Wow64VectoredExceptionHandlers[ i ];
+        
+        if ( CurrentHandler == NULL )
+            continue;
+
+        LONG Result = CurrentHandler( ExceptionContext, ExceptionRecord );
+
+        if ( Result == EXCEPTION_CONTINUE_EXECUTION )
+        {
+            Context->Rcx = ( UINT64 )ExceptionContext;
+            Context->Rdx = FALSE;
+            Context->Rip = NtContinue64;
+
+            return;
+        }
+    }
+
+    //
+    // Simulate the 'cld' instruction
+    //
+    Context->EFlags &= ~( 1 << 10 );
+
+    //
+    // Simulate the 'mov rax, cs:Wow64PrepareForException' instructon
+    //
+    Context->Rax = g_Wow64PrepareForException;
+
+    //
+    // Increment by the length of the instructions we just simulated
+    //
+    Context->Rip += 8;
+}
+
+BOOLEAN
+Wow64RemoveVectoredExceptionHandler( 
+    _In_ PWOW64_VECTORED_EXCEPTION_HANDLER VectoredHandler 
+    )
+{
+    Wow64AcquireSpinlock( g_Wow64VEHListLock );
+
+    BOOLEAN Result = FALSE;
+
+    for ( UINT32 i = 0; i < WOW64_MAX_VECTORED_HANDLERS; i++ )
+    {
+        if ( g_Wow64VectoredExceptionHandlers[ i ] == VectoredHandler )
+        { 
+             g_Wow64VectoredExceptionHandlers[ i ] = NULL;
+             Result = TRUE;
+             break;
+        }
+    }
+
+    Wow64ReleaseSpinlock( g_Wow64VEHListLock );
+
+    return Result;
+}
+
+BOOLEAN
+Wow64AddVectoredExceptionHandler(
+    _In_ PWOW64_VECTORED_EXCEPTION_HANDLER VectoredHandler 
+    )
+{
+    Wow64AcquireSpinlock( g_Wow64VEHListLock );
+
+    BOOLEAN Result = FALSE;
+
+    if ( g_Wow64PrepareForException == NULL )
+    {
+        UINT64 Wow64Dll = Wow64GetModuleHandleA( "WOW64.DLL" ),
+               NtDll    = Wow64GetModuleHandleA( "NTDLL.DLL" );
+
+        //
+        // Resolve Wow64PrepareForException for our KiUserExceptionDispatcher hook
+        //
+        g_Wow64PrepareForException = Wow64GetProcAddress( Wow64Dll, "Wow64PrepareForException" );
+
+        //
+        // Resolve NtContinue
+        // 
+        NtContinue64 = Wow64GetProcAddress( NtDll, "NtContinue" );
+
+        if ( g_Wow64PrepareForException == NULL || NtContinue64 == NULL )
+        {
+            return Result;
+        }
+
+        //
+        // Redirect ntdll!KiUserExceptionDispatcher to our handler
+        //
+        Result = Wow64InstallHook( 
+            Wow64GetProcAddress( NtDll, "KiUserExceptionDispatcher" ), 
+            Wow64HandleKiUserExceptionDispatcher 
+            );
+
+        if ( Result == FALSE )
+        {
+            return Result;
+        }
+
+        //
+        // Initialize the VEH list
+        //
+        RtlZeroMemory( g_Wow64VectoredExceptionHandlers, sizeof( g_Wow64VectoredExceptionHandlers ) );
+    }
+
+    for ( UINT32 i = 0; i < WOW64_MAX_VECTORED_HANDLERS; i++ )
+    {
+        if ( g_Wow64VectoredExceptionHandlers[ i ] == NULL )
+        { 
+             g_Wow64VectoredExceptionHandlers[ i ] = VectoredHandler;
+             Result = TRUE;
+             break;
+        }
+    }
+
+    Wow64ReleaseSpinlock( g_Wow64VEHListLock );
+
+    return FALSE;
 }
 
 #pragma warning( pop )
